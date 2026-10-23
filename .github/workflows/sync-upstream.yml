@@ -1,0 +1,112 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Every six hours, offset from the busy start of the hour (UTC).
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even without upstream changes (first build or retry)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Keep synchronization and the called build serialized so an older build cannot
+# overwrite latest after a newer one. Never interrupt an in-progress push/build.
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Synchronize upstream without overwriting local changes
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+          UPSTREAM_REPO: https://github.com/asupc/sub2api.git
+          UPSTREAM_BRANCH: master
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          before=$(git rev-parse HEAD)
+
+          if git merge-base --is-ancestor "$upstream_ref" HEAD; then
+            echo 'Upstream is already synchronized.'
+          elif git merge --ff-only "$upstream_ref"; then
+            echo 'Fast-forwarded to upstream.'
+          else
+            # Local CI/docs commits cause divergence; preserve both histories.
+            # Fail on conflicts or unrelated histories rather than force-pushing.
+            if ! git merge --no-edit "$upstream_ref"; then
+              git merge --abort || true
+              echo '::error::Upstream merge failed. Resolve conflicts manually; no changes were pushed.'
+              exit 1
+            fi
+          fi
+
+          # This fork owns its CI configuration. Missing upstream files do not
+          # delete local additions in a merge; also block future CI changes or
+          # deletions explicitly, before anything can reach the remote branch.
+          if ! git diff --quiet "$before" HEAD -- \
+            .github/workflows/ .github/dependabot.yml AUTO-BUILD.md; then
+            echo '::error::Upstream synchronization changed protected automation files. Review and merge manually; no changes were pushed.'
+            exit 1
+          fi
+
+          sha=$(git rev-parse HEAD)
+          changed=false
+          if [[ "$sha" != "$before" ]]; then
+            # A concurrent external push is intentionally rejected, never forced.
+            auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+            echo "::add-mask::$auth"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Upstream synchronization'
+            echo "- Upstream: ${UPSTREAM_REPO} (${UPSTREAM_BRANCH})"
+            echo "- Target branch: ${TARGET_BRANCH}"
+            echo "- Pushed changes: ${changed}"
+            echo "- Source commit: ${sha}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build)
+    # GITHUB_TOKEN pushes do not trigger push workflows; call explicitly instead.
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      source_sha: ${{ needs.sync.outputs.sha }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

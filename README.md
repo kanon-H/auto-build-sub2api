@@ -1,3 +1,10 @@
+> ⚠️ **Unofficial Automated Build**
+> This is an unofficial automated Docker image build of [sub2api](https://github.com/asupc/sub2api).
+> All credits go to the original authors. This repository only provides CI/CD automation.
+> Upstream source: https://github.com/asupc/sub2api
+>
+> 自动构建配置、首次发布与故障恢复见 [AUTO-BUILD.md](AUTO-BUILD.md)。
+
 <div align="center">
 
 <img src="assets/logo.svg" alt="Sub2API Logo" width="128" />

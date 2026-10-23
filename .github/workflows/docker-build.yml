@@ -1,0 +1,116 @@
+name: Build Docker image
+
+# Only the synchronization workflow calls this; ordinary pushes do not publish.
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact synchronized commit to build
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      IMAGE_NAME: sub2api
+    steps:
+      - name: Validate Docker Hub credentials
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo '::error::Configure DOCKERHUB_USERNAME and DOCKERHUB_TOKEN in repository Actions secrets.'
+            exit 1
+          fi
+
+      - name: Checkout synchronized source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Generate image metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          tag="$(date -u +%Y%m%d)-${sha:0:12}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "image=docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push multi-platform image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            COMMIT=${{ steps.meta.outputs.sha }}
+            DATE=${{ steps.meta.outputs.created }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          labels: |
+            org.opencontainers.image.title=Unofficial sub2api build
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            org.opencontainers.image.url=https://github.com/asupc/sub2api
+          cache-from: type=gha,scope=sub2api-multiarch
+          cache-to: type=gha,mode=max,scope=sub2api-multiarch
+          provenance: mode=min
+          sbom: true
+
+      - name: Report published image digest
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION_TAG: ${{ steps.meta.outputs.tag }}
+          SOURCE_SHA: ${{ steps.meta.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Published image digest: ${DIGEST}"
+          {
+            echo '### Published Docker image'
+            echo "- Image: ${IMAGE}:latest"
+            echo "- Version: ${IMAGE}:${VERSION_TAG}"
+            echo "- Platforms: linux/amd64, linux/arm64"
+            echo "- Source: https://github.com/${GITHUB_REPOSITORY}/commit/${SOURCE_SHA}"
+            echo "- Digest: ${DIGEST}"
+            echo "- Pull immutable image: docker pull ${IMAGE}@${DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
