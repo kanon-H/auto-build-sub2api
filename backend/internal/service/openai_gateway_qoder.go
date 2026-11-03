@@ -85,10 +85,26 @@ func qoderAccountRealm(account *Account) string {
 	return "cn"
 }
 
+// qoderClientSessionKey 取入站会话头的会话键（源 extract_session_key 的头半边：
+// X-Conversation-Id / Conversation-Id / X-Session-Id / Session-Id）。
+// 用于上游会话身份稳定化（chat_record_id/business.id 会话内复用）。
+func qoderClientSessionKey(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	for _, key := range []string{"X-Conversation-Id", "Conversation-Id", "X-Session-Id", "Session-Id"} {
+		if v := strings.TrimSpace(c.Request.Header.Get(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // applyQoderChatBody 把标准 OpenAI CC 请求体改写为 agent_chat_generation 请求体
 // （BuildAgentChatBody：baseprompt 骨架 + 消息压平/脱敏 + 模型 key 解析 +
-// qoder_encode）。返回值是上游的编码载荷（不透明字符串）。
-func applyQoderChatBody(account *Account, body []byte) ([]byte, error) {
+// qoder_encode）。clientSessionKey 为入站会话头解析出的会话键（可为空）。
+// 返回值是上游的编码载荷（不透明字符串）。
+func applyQoderChatBody(account *Account, body []byte, clientSessionKey string) ([]byte, error) {
 	var openAIReq map[string]any
 	if err := json.Unmarshal(body, &openAIReq); err != nil {
 		return nil, fmt.Errorf("parse openai body for qoder: %w", err)
@@ -98,7 +114,7 @@ func applyQoderChatBody(account *Account, body []byte) ([]byte, error) {
 		return nil, err
 	}
 	realm := qoderAccountRealm(account)
-	encoded, err := qoder.BuildAgentChatBody(openAIReq, sess, realm)
+	encoded, err := qoder.BuildAgentChatBody(openAIReq, sess, realm, clientSessionKey)
 	if err != nil {
 		return nil, fmt.Errorf("build qoder agent chat body: %w", err)
 	}
@@ -476,11 +492,16 @@ func qoderLearnStreamError(account *Account, model string, err error) (int, stri
 //	其余（瞬时错/未知）       → 502（既有 failover 链）
 func classifyQoderUpstreamFailure(code int, detail string) int {
 	switch {
-	case qoder.SessionDead(detail):
-		return http.StatusUnauthorized
 	case qoder.IsQueuedReject(detail):
 		// 10605 排队：403 信封但语义是"服务暂不可用，N 秒后重试"。
 		return http.StatusTooManyRequests
+	case code == http.StatusForbidden && qoder.IsQuotaReject(detail):
+		// issue #108：额度类 403（112 额度耗尽 / 110 每日次数上限）不是鉴权失败，
+		// 长冷却 + 换号；对外按软限流（可重试）而非 401。判定顺序与两个处置函数
+		// 一致（排队 → 额度 → 凭证失效）：detail 同时含 TOKEN_EXPIRE 时按额度处理。
+		return http.StatusTooManyRequests
+	case qoder.SessionDead(detail):
+		return http.StatusUnauthorized
 	case code == http.StatusUnauthorized || code == http.StatusForbidden:
 		return http.StatusUnauthorized
 	case code == http.StatusPaymentRequired:
@@ -534,6 +555,29 @@ func (s *OpenAIGatewayService) qoderCoolAccountForLimit(ctx context.Context, acc
 	}
 }
 
+// qoderCoolAccountForQuota 额度类 403 的账号冷却（issue #108 / 移植
+// qoder2api-hub 1033662）：按病因冷却（112 30min / 110 到 0 点封顶 6h）。
+// **刻意不接 qoderSingleAccountPool 的跳过**——额度问题重试无效，单号池也应
+// 冷却到恢复时刻，而不是被 3s 压成反复撞墙（源注释同款）。
+func (s *OpenAIGatewayService) qoderCoolAccountForQuota(ctx context.Context, account *Account, detail string) {
+	if s == nil || s.accountRepo == nil || account == nil {
+		return
+	}
+	kind, cooldown := qoder.QuotaCooldown(detail, time.Now())
+	if kind == "" || cooldown <= 0 {
+		return
+	}
+	logger.L().Warn("qoder quota 403: cooling account",
+		zap.Int64("account_id", account.ID),
+		zap.String("kind", kind),
+		zap.Duration("cooldown", cooldown),
+	)
+	if err := s.accountRepo.SetRateLimited(ctx, account.ID, time.Now().Add(cooldown)); err != nil {
+		logger.L().Warn("qoder set rate limit failed",
+			zap.Int64("account_id", account.ID), zap.Error(err))
+	}
+}
+
 // applyQoderUpstreamFailurePolicy 流内错误的账号级处置（ctx 经 WithoutCancel
 // 使用：客户端可能已断开，处置不能随之取消）：
 //
@@ -553,6 +597,9 @@ func (s *OpenAIGatewayService) applyQoderUpstreamFailurePolicy(ctx context.Conte
 		//（缺省 30s，封顶 SoftRateMax），不罚号、不触发 token 刷新；单账号池
 		// 跳过冷却（429/排队是模型级状态，账号级冻结会拖死唯一账号的可用模型）。
 		s.qoderCoolAccountForLimit(actionCtx, account, float64(qoder.RetryAfterSeconds(detail)))
+	case code == http.StatusForbidden && qoder.IsQuotaReject(detail):
+		// issue #108：额度类 403 长冷却换号，不刷新 token（配额不是凭证失效）。
+		s.qoderCoolAccountForQuota(actionCtx, account, detail)
 	case qoder.SessionDead(detail) || code == http.StatusUnauthorized || code == http.StatusForbidden:
 		logger.L().Warn("qoder upstream rejected credentials",
 			zap.Int64("account_id", account.ID),
@@ -631,6 +678,13 @@ func (s *OpenAIGatewayService) handleQoderUpstreamError(
 		cooldown, _ := qoder.EnvelopeCooldown(code, detail, false, true)
 		s.qoderCoolAccountForLimit(ctx, account, cooldown)
 		appendFailover("queued")
+		return true, s.newOpenAIAccountFailoverError(account, code, resp.Header, respBody, upstreamMsg, false, false)
+
+	case code == http.StatusForbidden && qoder.IsQuotaReject(detail):
+		// issue #108：额度类 403（112 额度耗尽 / 110 每日次数上限）不是凭证失效，
+		// 长冷却 + 换号；不触发 token 刷新、不禁用账号。
+		s.qoderCoolAccountForQuota(ctx, account, detail)
+		appendFailover("quota")
 		return true, s.newOpenAIAccountFailoverError(account, code, resp.Header, respBody, upstreamMsg, false, false)
 
 	case qoder.SessionDead(detail) || code == http.StatusUnauthorized || code == http.StatusForbidden:

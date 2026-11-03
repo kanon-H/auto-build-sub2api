@@ -890,15 +890,19 @@ func anyOrDefault(v, def any) any {
 // 对象，否则 400 "'function' is a required property, expected an object -
 // 'tools.N'"。已嵌套的原样透传（幂等）；非对象条目按 Python 版语义丢弃。
 func normalizeTools(tools []any) []any {
-	norm := make([]any, 0, len(tools))
-	for _, t := range tools {
+	// issue #127：Codex/MCP 的 type:"namespace" 容器递归展开为平铺工具（深度 4），
+	// 不再整块丢弃 —— 丢弃会让客户端声明的工具静默消失（请求 200、调用永不发生）。
+	// 子工具保留自身声明名；同名只留第一个。容器本身不出站（上游只认 function）。
+	flat, _ := flattenNamespaceTools(tools, 0, nil)
+	norm := make([]any, 0, len(flat))
+	for _, t := range flat {
 		m, ok := t.(map[string]any)
 		if !ok {
 			continue
 		}
-		// issue #63：上游不支持的工具类型（namespace / web_search）在出站前丢弃，
-		// 避免 400。其余非 function 工具原样透传（与 Python 侧一致）。
-		if typ, _ := m["type"].(string); typ == "namespace" || typ == "web_search" {
+		// issue #63：上游不支持的工具类型（web_search）在出站前丢弃，避免 400。
+		// 其余非 function 工具原样透传（与 Python 侧一致）。
+		if typ, _ := m["type"].(string); typ == "web_search" {
 			continue
 		}
 		if hasKey(m, "name") && !hasKey(m, "function") && m["type"] == "function" {
@@ -918,6 +922,115 @@ func normalizeTools(tools []any) []any {
 	return norm
 }
 
+// namespace 工具容器的展开参数（源 _NS_MAX_DEPTH / _NS_CHILD_KEYS）。
+const namespaceMaxDepth = 4
+
+var namespaceChildKeys = []string{"tools", "children", "functions"}
+
+// namespaceToolName 工具声明里的名字（Responses 平铺形态或 Chat function 形态）。
+func namespaceToolName(tool map[string]any) string {
+	if n, _ := tool["name"].(string); strings.TrimSpace(n) != "" {
+		return strings.TrimSpace(n)
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		if n, _ := fn["name"].(string); strings.TrimSpace(n) != "" {
+			return strings.TrimSpace(n)
+		}
+	}
+	return ""
+}
+
+// namespaceChildren 取容器的子工具列表（tools/children/functions 第一个非空）。
+func namespaceChildren(tool map[string]any) []any {
+	for _, key := range namespaceChildKeys {
+		if list, ok := tool[key].([]any); ok && len(list) > 0 {
+			return list
+		}
+	}
+	return nil
+}
+
+// isNamespaceTool 是不是 namespace 容器（源 _is_namespace_tool）：显式
+// type:"namespace"，或**省略 type** 但带非空 children/functions/tools 的形态。
+func isNamespaceTool(tool map[string]any) bool {
+	typ := strings.TrimSpace(anyString(tool["type"]))
+	if typ == "namespace" {
+		return true
+	}
+	if typ == "" && len(namespaceChildren(tool)) > 0 {
+		return true
+	}
+	return false
+}
+
+// flattenNamespaceTools 把 namespace 容器递归展开成平铺工具（源
+// _flatten_ns_tools / issue #127 F1）。返回 (flat, ns_map)，ns_map 记录
+// 工具名 → namespace（本函数内仅内部使用；直打 chat 路径不需要回程还原，
+// Responses 回程由 pkg/apicompat 桥处理）。
+//
+// 重名策略：同名只留第一个（两个 MCP server 有同名工具时展平后无法区分，
+// 保留第一个至少让其中一个是可用的）。子层用独立的 seen 集合——共享会让
+// 递归先登记、父层再判重时把所有子工具都当成重复丢掉。
+func flattenNamespaceTools(tools []any, depth int, seen map[string]bool) ([]any, map[string]string) {
+	nsMap := map[string]string{}
+	if seen == nil {
+		seen = map[string]bool{}
+	}
+	flat := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if isNamespaceTool(tool) {
+			if depth >= namespaceMaxDepth {
+				continue
+			}
+			ns := strings.TrimSpace(anyString(tool["name"]))
+			if ns == "" {
+				ns = strings.TrimSpace(anyString(tool["namespace"]))
+			}
+			sub, subMap := flattenNamespaceTools(namespaceChildren(tool), depth+1, map[string]bool{})
+			for k, v := range subMap {
+				nsMap[k] = v
+			}
+			for _, item := range sub {
+				m, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				name := namespaceToolName(m)
+				if name != "" {
+					if seen[name] {
+						continue
+					}
+					seen[name] = true
+					if ns != "" {
+						nsMap[name] = ns
+					}
+				}
+				flat = append(flat, m)
+			}
+			continue
+		}
+		name := namespaceToolName(tool)
+		if name != "" {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+		}
+		flat = append(flat, tool)
+	}
+	return flat, nsMap
+}
+
+// anyString 安全取字符串值。
+func anyString(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
 // BuildAgentChatBody 以官方 baseprompt.json 为骨架构造 agent_chat_generation
 // 上游请求体并返回 qoder_encode 后的出站 body（对齐 qoder_proxy.py
 // build_qoder_body L3537-3673 的覆写逻辑）：
@@ -933,7 +1046,9 @@ func normalizeTools(tools []any) []any {
 // 经 ResolveUpstreamKey 解析（带 realm，对齐 Python resolve_upstream_key(model,
 // realm=realm)——不带区域会丢跨区显示名校验）；realm 供结构化工具历史门控
 // 判断（cn/intl）与目录元数据查取。
-func BuildAgentChatBody(openAIReq map[string]any, session *CosySession, realm string) (string, error) {
+// 可选的 clientSessionKey 是上游会话键的 HTTP 头半边（X-Conversation-Id 等，
+// 源 extract_session_key 头优先）；为空时回落到请求体解析。
+func BuildAgentChatBody(openAIReq map[string]any, session *CosySession, realm string, clientSessionKey ...string) (string, error) {
 	body, err := Baseprompt()
 	if err != nil {
 		return "", err
@@ -990,9 +1105,26 @@ func BuildAgentChatBody(openAIReq map[string]any, session *CosySession, realm st
 		}
 	}
 
+	// issue #128：同一客户端会话复用稳定身份（chat_record_id / business.id /
+	// begin_at），避免一个 agent 回合被上游记成几十条对话撞 code 110 日上限。
+	// request_id / request_set_id 仍逐请求唯一（计费与限额按请求计数）。
+	// 会话键头优先（源 extract_session_key），缺失时回落到请求体解析。
+	clientKey := ""
+	if len(clientSessionKey) > 0 {
+		clientKey = strings.TrimSpace(clientSessionKey[0])
+	}
+	if clientKey == "" {
+		clientKey = extractClientSessionKey(openAIReq)
+	}
+	conv := ConversationIdentity(clientKey, openAIReq)
+
 	nid := UUID4()
 	body["request_id"] = nid
-	body["chat_record_id"] = nid
+	if conv != nil {
+		body["chat_record_id"] = conv.id
+	} else {
+		body["chat_record_id"] = nid
+	}
 	body["request_set_id"] = UUID4()
 	body["session_id"] = UUID4() // 占位；下方 AssignSessionID 可能按前缀亲和覆写
 	body["stream"] = true
@@ -1108,8 +1240,14 @@ func BuildAgentChatBody(openAIReq map[string]any, session *CosySession, realm st
 	if biz == nil {
 		biz = map[string]any{}
 	}
-	biz["id"] = UUID4()
-	biz["begin_at"] = time.Now().UnixMilli()
+	bizID := UUID4()
+	beginAt := time.Now().UnixMilli()
+	if conv != nil {
+		bizID = conv.id
+		beginAt = conv.beginAt
+	}
+	biz["id"] = bizID
+	biz["begin_at"] = beginAt
 	name := "chat"
 	if prompt != "" {
 		name = pySlice(prompt, 0, 30)
@@ -1118,6 +1256,12 @@ func BuildAgentChatBody(openAIReq map[string]any, session *CosySession, realm st
 	setDefault(biz, "product", "cli")
 	setDefault(biz, "type", "agent")
 	setDefault(biz, "stage", "start")
+	// 计费归属（移植 qoder2api-hub PR #119 / f686228）：官方 CLI 的 business 块
+	// 带 model_key，上游计费归因读它；缺失时 kmodel_latest 这类模型被 qoder 后台
+	// 静默记成 auto（老模型疑似有 model_config 兜底，故表现为「只有某模型计费异常」）。
+	// version 与 cosy-version 同源（模板里的 0.1.43 是上个时代的残留）。
+	biz["model_key"] = modelKey
+	biz["version"] = COSYVersion
 	body["business"] = biz
 
 	// 前缀会话亲和（opt-in，issue: 前缀会话亲和）：同消息前缀优先复用稳定
