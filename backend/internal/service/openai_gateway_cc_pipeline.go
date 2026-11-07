@@ -40,6 +40,7 @@ func (s *OpenAIGatewayService) newUpstreamSSEScanner(r io.Reader) *bufio.Scanner
 		maxLineSize = s.cfg.Gateway.MaxLineSize
 	}
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
+	scanner.Split(newBoundedSSESplit(s.cfg, maxLineSize, nil))
 	return scanner
 }
 
@@ -359,7 +360,7 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// trae：上游响应恒为 SOLO 私有 SSE，在交回调用方前转换为下游期望的形态
 	// （流式→OpenAI SSE 管道；非流式→本地聚合的 chat.completion JSON）。
 	if account.Platform == PlatformTrae {
-		if traeErr := s.wrapTraeChatResponse(ctx, account, resp, stream, gjson.GetBytes(body, "model").String()); traeErr != nil {
+		if traeErr := s.wrapTraeChatResponse(ctx, c, account, resp, stream, gjson.GetBytes(body, "model").String()); traeErr != nil {
 			_ = resp.Body.Close()
 			return nil, traeErr
 		}
