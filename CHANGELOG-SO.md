@@ -8,12 +8,12 @@
 
 | 项 | 状态 |
 |---|---|
-| 上游基准 | `UPSTREAM-BASE`=`6b4b37db`（v0.2.20）；`backend/cmd/server/VERSION`=0.2.20 |
+| 上游基准 | `UPSTREAM-BASE`=`530c5e3a`（v0.2.21）；`backend/cmd/server/VERSION`=0.2.21 |
 | 移植源基准 | `PORTER-BASE` 文件：workbuddy `6e1e548`（workbuddy2api-hub v1.10.11）、qoder `70ba58b`（v1.7.30）、trae `dfa5bf7`（2026.11.51421）（2026-11-06 推进） |
 | 后端 | 代码 = v0.2.20 + 二开（三平台源码集成、Antigravity 直接模型模式、复合分组同族多平台调度、推理档位全量透传、OpenCode reasoning 回放收口、账号/计费/网关定制，逐项见时间线）；模型能力测评已于 10-23 整体移除 |
 | 前端 | 二开：功能入口裁剪 + UI/UX 体系重构 + 仪表盘/用量统计/账号表格增强；模型能力中心收敛为模型清单单页（无评分）；用量统计含「按 API 统计用量」与模型分布折叠 |
 | 数据库 | 官方迁移序列终态（裁剪期 drop 的表由 `deploy/restore-upstream-schema.sql` 恢复，可重放幂等）；二开迁移命名 `NNN_so_*.sql`，最新占用 250（测评表 DROP），后续从 251+ 起 |
-| 验证基线 | 2026-11-07（同步 v0.2.20 后）：后端 `go build`/`go vet`（含 `-tags=unit`）全通过，unit 仅 6 个已知存量失败（Gemini thinking variant ×2 子例 / 复合分组族 ×2 / antigravity 目录跳过 / effort 透传遗留 / prompt-audit 路由覆盖，与 HEAD 基线一致，无新增）；前端 typecheck + vitest（297 文件 / 2329 用例）+ build 全绿 |
+| 验证基线 | 2026-11-11（同步 v0.2.21 后）：后端 `go build`/`go vet`（含 `-tags=unit`）全通过，unit 仅 6 个已知存量失败（Gemini thinking variant ×2 子例 / 复合分组族 ×2 / antigravity 目录跳过 / effort 透传遗留 / prompt-audit 路由覆盖，与 HEAD 基线一致，无新增）；前端 typecheck + vitest（297 文件 / 2343 用例）+ build 全绿 |
 | 线上实例 | `sub2api:0.2.17-so-20261026-2`（本机 Compose `/vol2/1000/docker/sub2api/`；旧 tag 均保留作回滚点） |
 
 - **功能边界**：支付永久不同步（2026-10-08 用户指示；上游 #7881 EasyPay 回调签名修复未同步，启用支付前需补）；en 语言包永久跳过；前端已删入口的官方功能视为隐藏（后端接口与表随官方保留）。
@@ -296,4 +296,14 @@
 - **合并影响**：无上游同步冲突面（上游 `pnpm-workspace.yaml` 为空文件、本就是二开新增；lockfile 同步时按「采用上游版」口径覆盖即可，但**覆盖后必须用 pnpm 9 重生成**，见 286 行同步记录的改进点）。不触碰 `UPSTREAM-BASE` / `PORTER-BASE`。
 - **验证**：模拟根 `Dockerfile` 全顺序（干净目录 → `pnpm@9.15.9 install --frozen-lockfile` → `pnpm run build`）全通过；另在隔离目录用 pnpm 9 全量 `install --frozen-lockfile` 通过。本机 pnpm 12 重装 `node_modules` 后 `typecheck` / `test:run`（297 文件 / 2329 用例）/ `build` 全绿，且 lockfile 的 overrides 段保持完好（双写防复发验证）；pnpm 9 与 pnpm 12 的 `--frozen-lockfile` 交叉校验均通过。
 - **约定补充**：今后改任一 overrides 项必须同时改 `package.json` 与 `pnpm-workspace.yaml`，并用 **pnpm 9** 重生成 lockfile；本机如需 `pnpm install` 后应复核 `pnpm-lock.yaml` 的 `overrides:` 段是否仍在。
+
+### 同步 v0.2.21（2026-11-11）
+
+- **区间与规模**：`6b4b37db → 530c5e3a`（83 提交 / 202 文件，+6702/-559）。二开侧：87 个未改文件直接覆盖、34 个上游新增复制、42 个三路自动合并、11 个冲突手工裁决（另同步删除上游移除的 `assets/partners/logos/lanox.jpg`）。版本号 `VERSION`→0.2.21（tag `v0.2.21` 一致）。
+- **同步功能**：① **Claude Fable / Mythos 5.2 网关支持**（`pkg/claude/constants.go`、`effort_catalog.go`、`pkg/apicompat` 请求/响应转换、定价兜底）；② **OpenAI/Codex 一批修复**（新增 `openai_page_context.go` 页面上下文规范化、Responses session seed 跨工具循环稳定、封存函数调用元数据、非法 UTF-8 请求体拒绝、cache-write TTL 计费与迁移 `250_openai_cache_write_ttl.sql`、WebSocket 首帧 TTFT、native image 错误状态）；③ **网关内存预算**按 cgroup 上限自动计算（新增 `pkg/sysutil/memory.go`，`os.Root` 限定挂载读取）；④ **调度/认证/限流修复**（刷新令牌原子轮换、账号 hydrate 失败释放 slot、容量降级匹配真实错误字段、Pro Argon 冷却隔离）；⑤ **Antigravity** 用量查询按钮（`force` 绕过缓存）与工具 functionResponses 连续性；⑥ **性能与运维**（API 密钥列表不再等待 30 天用量 + 迁移 `249_add_usage_logs_api_key_cost_index_notx.sql` 覆盖索引、审计任务入队即唤醒 worker、系统设置保存按钮底部吸附浮标）；⑦ **前端**：账号用量单元、KeysView 用量提示、UsageTable、UseKeyModal、AccountsView 刷新保留行等；⑧ 文档 `docs/OPENAI_IMAGES_CODEX.md`。
+- **冲突裁决（11 文件）**：`account_usage_service.go` 采用上游 `cachedAntigravityUsage` 辅助函数（与二开内联 `force` 缓存语义等价，并由上游新测试覆盖）；`openai_gateway_service.go`/`openai_gateway_response_handling.go` 保留二开 `Credits` 字段并融入上游 `CacheCreation30m/12hInputTokens`；`openai_gateway_messages_chat_fallback.go` 保留二开「不重写 ReasoningEffort」语义，仅并入上游 GPT-6.1 Sol 清空 Temperature/TopP；`AccountUsageCell.vue` 融合上游 `data-testid="antigravity-active-query"` 与 `v-if="!loading"`（保留二开 flex 布局）；`SettingsView.vue`/zh `admin/settings.ts`/zh `dashboard.ts` 冲突块均为二开裁剪的支付页/可用渠道，保持二开现状；README 三语言冲突保留二开赞助商与图片文档裁剪。
+- **渠道类型最小合入**：为保留的 `GroupsView` 分组定价，`components/admin/channel/types.ts` 与 zh `admin/channels.ts` 的 `cache_write_12h_price` 字段/i18n 增量照常合入（真渠道 UI `ChannelsView`/`IntervalRow`/`PricingEntryCard` 仍按裁剪跳过）。
+- **测试适配**：上游新增 `TestCachedAntigravityUsage_*` 依赖 helper，随之引入；`AccountUsageCell.spec.ts` 上游「query button」用例数据改为二开 `buckets` 口径；`AccountsView.lite.spec.ts` 依赖 `@refresh` 事件，在 `AccountsView.vue` 补 `@refresh="handleManualRefresh"` 绑定（二开 UI 无刷新按钮，行为不变）。
+- **跳过项**：支付链路（`internal/payment/*`、`payment_config_service.go`、`PaymentView.vue`、`providerConfig.ts`、`rechargeBonus.ts`、支付 provider 测试）永久不同步；渠道 UI（`ChannelsView.vue`、`IntervalRow.vue`、`PricingEntryCard.vue`、`api/(admin/)channels.ts`、`SupportedModelChip.vue`）按裁剪跳过；模型广场（`api/modelPlaza.ts`、`PlazaModelPricingTable.vue`）；`utils/pricing.ts` 与 en 语言包（已删）。
+- **验证**：后端 `go build ./...`、`go vet ./...`、`go vet -tags=unit ./...` 全通过；`go test -tags=unit ./...` 失败 6 项与基线完全一致（Gemini thinking ×2 子例 / 复合分组族 ×2 / antigravity 目录跳过 / effort 透传 / prompt-audit 路由覆盖），无新增失败。前端 `pnpm typecheck`、`pnpm test:run`（297 文件 / 2343 用例）、`pnpm build` 全通过。版本号：`VERSION`=0.2.21 == 上游 `VERSION@530c5e3a`，tag `v0.2.21`。支付链路与 en 语言包零变更（`git status` 复核）。
 
