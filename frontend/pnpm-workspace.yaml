@@ -1,6 +1,20 @@
 # pnpm 9 要求 workspace 文件必须含 packages 字段（单项目声明为根即可）
 packages:
   - .
+# 与 package.json#pnpm.overrides 保持逐项一致：pnpm 10+ 不再读取 package.json
+# 中的 pnpm.overrides（视为死配置），只认本文件的 overrides。两处并存可使
+# 根 Dockerfile 的 pnpm@9 与本机 pnpm 12 生成同一份 lockfile，避免本机执行
+# pnpm install 后洗掉 lockfile 的 overrides 段、导致镜像内 --frozen-lockfile
+# 报 ERR_PNPM_LOCKFILE_CONFIG_MISMATCH（2026-11-09 修复）。
+# 新增/修改覆盖项时必须同时改 package.json 与此处，并用 pnpm 9 重生成 lockfile。
+overrides:
+  js-cookie: 3.0.7
+  form-data@<4.0.6: '>=4.0.6'
+  postcss@<8.5.18: '>=8.5.18'
+  dompurify@<3.4.17: '>=3.4.17'
+  source-map-js@<1.2.2: '>=1.2.2'
+  follow-redirects@<1.16.2: '>=1.16.2'
+  decode-uri-component@<0.5.1: '>=0.5.1'
 allowBuilds:
   esbuild: true
   vue-demi: true
