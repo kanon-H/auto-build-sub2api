@@ -10,13 +10,13 @@
 #      删除，KEEP_LOCAL_TAR=1 保留）
 #   3. scp 推送 tar 到 NAS /vol2/1000/DockerImages 归档，远端 sha256 校验
 #      后 docker load（并核对 load 出的镜像名）
-#   4. 部署前经 SSH 在 NAS 上 pg_dump 备份数据库到 <COMPOSE_DIR>/data/
+#   4. 部署前经 SSH 在 NAS 上 pg_dump 备份数据库到 <COMPOSE_DIR>/data/（自动执行）
 #   5. 备份并改写 NAS <COMPOSE_DIR>/docker-compose.yml 的 image: tag
 #   6. 远端 docker compose up -d 重建容器，验证 healthy + /health
 #
 # 用法（在开发机执行，任意目录）：
-#   bash deploy/build-and-deploy-nas.sh              # 全流程（交互确认）
-#   bash deploy/build-and-deploy-nas.sh -y           # 跳过确认（脚本化用）
+#   bash deploy/build-and-deploy-nas.sh              # 全流程（自动执行，不询问，含 pg_dump）
+#   bash deploy/build-and-deploy-nas.sh -y           # 兼容旧参数（现已默认自动执行）
 #   TAR_ONLY=1 bash deploy/build-and-deploy-nas.sh   # 只构建 + 本机出 tar，不部署
 #   VERSION=0.2.18 bash deploy/build-and-deploy-nas.sh
 #   COMMIT=11e53b1+oc-reasoning-fix bash ...         # 手动指定 commit 展示值
@@ -71,7 +71,6 @@ GZIP="${GZIP:-0}"
 KEEP_LOCAL_TAR="${KEEP_LOCAL_TAR:-0}"
 SKIP_DB_BACKUP="${SKIP_DB_BACKUP:-0}"
 TAR_ONLY="${TAR_ONLY:-0}"
-YES="${YES:-0}"
 
 # SSH 统一封装：BatchMode 禁交互（无免密立即失败）；accept-new 首连自动收录主机指纹。
 # 远端多步命令一律走 `rsh bash -s -- <参数> <<'EOF'` 形态，避免 ssh 拼参数丢引号。
@@ -83,7 +82,7 @@ rsh() { ssh "${SSH_OPTS[@]}" "${SSH_HOST}" "$@"; }
 # ---------------------------------------------------------------------------
 for arg in "$@"; do
   case "${arg}" in
-    -y|--yes) YES=1 ;;
+    -y|--yes) ;;   # 兼容旧参数：现已默认自动执行，无确认步骤
     -h|--help)
       sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
@@ -179,7 +178,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 4. 打印计划并确认
+# 4. 打印计划（自动执行，不交互确认）
 # ---------------------------------------------------------------------------
 echo "==> 版本        : ${VERSION}"
 echo "==> 上游基准    : ${BASE_HASH}"
@@ -197,14 +196,7 @@ else
   [ "${SKIP_DB_BACKUP}" = "1" ] && echo "==> 数据库备份  : 跳过（SKIP_DB_BACKUP=1）" || echo "==> 数据库备份  : 部署前 pg_dump 到 ${SSH_HOST}:${COMPOSE_DIR}/data/"
 fi
 
-if [ "${YES}" != "1" ]; then
-  ANSWER=""
-  read -r -p "确认执行？[y/N] " ANSWER || true
-  case "${ANSWER}" in
-    y|Y|yes|YES) ;;
-    *) echo "已取消。"; exit 0 ;;
-  esac
-fi
+# 不再交互确认：直接执行（部署前 pg_dump 备份默认自动进行，仅 SKIP_DB_BACKUP=1 可跳过）
 
 # ---------------------------------------------------------------------------
 # 5. 本机构建镜像（根目录 Dockerfile：pnpm@9 与 lockfile 格式匹配；见头注释）

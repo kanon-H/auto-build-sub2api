@@ -307,3 +307,10 @@
 - **跳过项**：支付链路（`internal/payment/*`、`payment_config_service.go`、`PaymentView.vue`、`providerConfig.ts`、`rechargeBonus.ts`、支付 provider 测试）永久不同步；渠道 UI（`ChannelsView.vue`、`IntervalRow.vue`、`PricingEntryCard.vue`、`api/(admin/)channels.ts`、`SupportedModelChip.vue`）按裁剪跳过；模型广场（`api/modelPlaza.ts`、`PlazaModelPricingTable.vue`）；`utils/pricing.ts` 与 en 语言包（已删）。
 - **验证**：后端 `go build ./...`、`go vet ./...`、`go vet -tags=unit ./...` 全通过；`go test -tags=unit ./...` 失败 6 项与基线完全一致（Gemini thinking ×2 子例 / 复合分组族 ×2 / antigravity 目录跳过 / effort 透传 / prompt-audit 路由覆盖），无新增失败。前端 `pnpm typecheck`、`pnpm test:run`（297 文件 / 2343 用例）、`pnpm build` 全通过。版本号：`VERSION`=0.2.21 == 上游 `VERSION@530c5e3a`，tag `v0.2.21`。支付链路与 en 语言包零变更（`git status` 复核）。
 
+
+### 部署脚本去掉交互确认（2026-11-11）
+
+- **变更**：`deploy/build-and-deploy-nas.sh` 移除「确认执行？[y/N]」交互提示（原第 4 步），执行即自动走完整个流程；部署前 `pg_dump` 数据库备份本就默认开启，现在随流程自动执行、不再有任何确认环节（仅 `SKIP_DB_BACKUP=1` 可显式跳过）。`-y/--yes` 保留为兼容空参数。
+- **改动文件**：`deploy/build-and-deploy-nas.sh`（头部用法说明同步更新）、`CHANGELOG-SO.md`（本条）。
+- **合并影响**：无（`deploy/` 为二开部署脚本，不触碰 `UPSTREAM-BASE` / `PORTER-BASE`）。
+- **验证**：`bash -n deploy/build-and-deploy-nas.sh` 语法检查通过。
