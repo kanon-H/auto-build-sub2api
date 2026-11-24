@@ -355,7 +355,7 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 
 	// 账号级请求头覆写：放在所有内置默认头（含 Grok CLI 身份头）之后应用，
 	// 使配置值获得除共享传输层强制头之外的最高优先级。
-	account.ApplyHeaderOverrides(upstreamReq.Header)
+	account.ApplyHeaderOverrides(upstreamReq.Context(), upstreamReq.Header)
 	applyOpenCodeSessionHeader(c, account, targetURL, upstreamReq.Header, body)
 
 	proxyURL := ""
@@ -372,6 +372,12 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	}
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	}
+	// 上游字节 idle 超时：读循环没有读超时，上游静默卡死会把请求挂到客户端断开
+	// （workbuddy2api-panel ab1ded7）。包在最内层，平台响应转换（trae/qoder/workbuddy）
+	// 的读取也受保护；0 表示关闭。
+	if idle := s.ccUpstreamStreamIdle(account); idle > 0 {
+		resp.Body = newCCUpstreamIdleBody(resp.Body, idle)
 	}
 	// trae：上游响应恒为 SOLO 私有 SSE，在交回调用方前转换为下游期望的形态
 	// （流式→OpenAI SSE 管道；非流式→本地聚合的 chat.completion JSON）。
